@@ -250,6 +250,19 @@ noscript {
   transform: translate(-50%, -50%);
 }
 
+.webgl-message {
+  position: absolute;
+  z-index: 20;
+  top: 50%;
+  left: 50%;
+  width: min(80vw, 360px);
+  margin: 0;
+  color: rgba(255, 235, 242, 0.8);
+  font: 13px/1.8 "Microsoft YaHei", sans-serif;
+  text-align: center;
+  transform: translate(-50%, -50%);
+}
+
 @keyframes reveal {
   from {
     opacity: 0;
