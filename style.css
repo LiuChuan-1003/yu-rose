@@ -36,7 +36,8 @@ canvas {
   height: 100dvh;
   overflow: hidden;
   background:
-    radial-gradient(circle at 50% 48%, rgba(75, 16, 39, 0.21), transparent 37%),
+    radial-gradient(circle at 50% 51%, rgba(112, 13, 54, 0.24), transparent 38%),
+    radial-gradient(circle at 50% 68%, rgba(53, 7, 29, 0.2), transparent 32%),
     linear-gradient(180deg, #080509 0%, #030203 100%);
 }
 
@@ -135,7 +136,7 @@ h1 {
   position: relative;
   display: grid;
   place-items: center;
-  min-width: 146px;
+  min-width: 158px;
   height: 44px;
   overflow: hidden;
   border: 1px solid rgba(255, 198, 218, 0.34);
