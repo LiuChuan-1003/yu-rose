@@ -2,21 +2,152 @@
   "use strict";
 
   const canvas = document.querySelector("#rose");
-  const ctx = canvas.getContext("2d", { alpha: true });
   const bloomButton = document.querySelector("#bloomButton");
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const gl = canvas.getContext("webgl", {
+    alpha: true,
+    antialias: true,
+    depth: false,
+    premultipliedAlpha: false,
+    powerPreference: "high-performance",
+  });
 
-  const TAU = Math.PI * 2;
-  const layerBlueprints = [
-    { count: 3, radius: 3, length: 29, height: 58, drop: 18, width: 1.12, curl: 20 },
-    { count: 4, radius: 10, length: 35, height: 55, drop: 23, width: 0.9, curl: 22 },
-    { count: 5, radius: 20, length: 40, height: 51, drop: 28, width: 0.72, curl: 25 },
-    { count: 6, radius: 33, length: 46, height: 45, drop: 34, width: 0.59, curl: 29 },
-    { count: 8, radius: 48, length: 52, height: 36, drop: 40, width: 0.47, curl: 34 },
-    { count: 10, radius: 67, length: 58, height: 25, drop: 45, width: 0.39, curl: 40 },
-    { count: 12, radius: 88, length: 64, height: 12, drop: 49, width: 0.33, curl: 47 },
-    { count: 15, radius: 109, length: 69, height: -4, drop: 50, width: 0.27, curl: 56 },
-  ];
+  if (!gl) {
+    const message = document.createElement("p");
+    message.className = "webgl-message";
+    message.textContent = "当前浏览器无法显示粒子花束，请换用最新版浏览器。";
+    document.querySelector(".stage").append(message);
+    return;
+  }
+
+  const vertexShaderSource = `
+    precision highp float;
+
+    attribute vec3 a_position;
+    attribute vec4 a_color;
+    attribute float a_size;
+    attribute float a_seed;
+    attribute vec3 a_scatter;
+    attribute float a_delay;
+    attribute float a_kind;
+
+    uniform vec2 u_resolution;
+    uniform vec2 u_center;
+    uniform float u_scale;
+    uniform float u_dpr;
+    uniform float u_time;
+    uniform float u_rotation_x;
+    uniform float u_rotation_y;
+    uniform float u_burst;
+    uniform float u_flash;
+    uniform float u_pass;
+
+    varying vec4 v_color;
+    varying float v_kind;
+
+    void main() {
+      float scatterAmount = clamp(u_burst - a_delay * 0.38, 0.0, 1.0);
+      scatterAmount = scatterAmount * scatterAmount * (3.0 - 2.0 * scatterAmount);
+      vec3 position = a_position + a_scatter * scatterAmount;
+
+      float breathing = 1.0 + sin(u_time * 0.72 + a_seed * 6.28318) * 0.0038;
+      position *= breathing;
+
+      float cy = cos(u_rotation_y);
+      float sy = sin(u_rotation_y);
+      position = vec3(
+        position.x * cy - position.z * sy,
+        position.y,
+        position.x * sy + position.z * cy
+      );
+
+      float cx = cos(u_rotation_x);
+      float sx = sin(u_rotation_x);
+      position = vec3(
+        position.x,
+        position.y * cx - position.z * sx,
+        position.y * sx + position.z * cx
+      );
+
+      float perspective = 730.0 / (730.0 + position.z * u_scale);
+      vec2 pixel = vec2(
+        u_center.x + position.x * u_scale * perspective,
+        u_center.y - position.y * u_scale * perspective
+      );
+      vec2 clip = vec2(
+        pixel.x / u_resolution.x * 2.0 - 1.0,
+        1.0 - pixel.y / u_resolution.y * 2.0
+      );
+
+      gl_Position = vec4(clip, clamp(position.z / 650.0, -0.95, 0.95), 1.0);
+      float twinkle = 0.83 + 0.17 * sin(u_time * 1.9 + a_seed * 19.0);
+      gl_PointSize = max(1.0, a_size * u_dpr * perspective * twinkle * (1.0 + u_flash * 0.12));
+      v_color = vec4(a_color.rgb * (1.0 + u_flash * 0.12), a_color.a * twinkle);
+      v_kind = a_kind;
+    }
+  `;
+
+  const fragmentShaderSource = `
+    precision mediump float;
+    varying vec4 v_color;
+    varying float v_kind;
+    uniform float u_pass;
+
+    void main() {
+      if (u_pass < 0.5 && v_kind > 0.5) discard;
+      if (u_pass > 0.5 && u_pass < 1.5 && abs(v_kind - 2.0) > 0.25) discard;
+      if (u_pass > 1.5 && abs(v_kind - 1.0) > 0.25) discard;
+      vec2 uv = gl_PointCoord - vec2(0.5);
+      float distanceToCenter = length(uv);
+      if (distanceToCenter > 0.5) discard;
+      float softness = smoothstep(0.5, 0.12, distanceToCenter);
+      gl_FragColor = vec4(v_color.rgb, v_color.a * softness);
+    }
+  `;
+
+  function compileShader(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || "Shader compilation failed");
+    }
+    return shader;
+  }
+
+  function createProgram() {
+    const program = gl.createProgram();
+    gl.attachShader(program, compileShader(gl.VERTEX_SHADER, vertexShaderSource));
+    gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "Shader link failed");
+    }
+    return program;
+  }
+
+  const program = createProgram();
+  const attributes = {
+    position: gl.getAttribLocation(program, "a_position"),
+    color: gl.getAttribLocation(program, "a_color"),
+    size: gl.getAttribLocation(program, "a_size"),
+    seed: gl.getAttribLocation(program, "a_seed"),
+    scatter: gl.getAttribLocation(program, "a_scatter"),
+    delay: gl.getAttribLocation(program, "a_delay"),
+    kind: gl.getAttribLocation(program, "a_kind"),
+  };
+  const uniforms = {
+    resolution: gl.getUniformLocation(program, "u_resolution"),
+    center: gl.getUniformLocation(program, "u_center"),
+    scale: gl.getUniformLocation(program, "u_scale"),
+    dpr: gl.getUniformLocation(program, "u_dpr"),
+    time: gl.getUniformLocation(program, "u_time"),
+    rotationX: gl.getUniformLocation(program, "u_rotation_x"),
+    rotationY: gl.getUniformLocation(program, "u_rotation_y"),
+    burst: gl.getUniformLocation(program, "u_burst"),
+    flash: gl.getUniformLocation(program, "u_flash"),
+    pass: gl.getUniformLocation(program, "u_pass"),
+  };
 
   const state = {
     width: 0,
@@ -24,191 +155,487 @@
     dpr: 1,
     scale: 1,
     mobile: false,
-    petals: [],
-    sparkles: [],
-    dust: [],
-    stars: [],
-    rotationX: -0.62,
-    rotationY: 0.28,
-    targetRotationX: -0.62,
-    targetRotationY: 0.28,
-    autoRotation: reduceMotion ? 0 : 0.0007,
-    openness: reduceMotion ? 1 : 0.08,
-    targetOpenness: 1,
-    sparkBurst: 0,
+    pointCount: 0,
+    randomState: 20260825,
+    rotationX: -0.09,
+    rotationY: 0.08,
+    targetRotationX: -0.09,
+    targetRotationY: 0.08,
+    autoRotation: reduceMotion ? 0 : 0.000045,
+    burst: reduceMotion ? 0 : 1.45,
     flash: 0,
     pointerDown: false,
     dragged: false,
     lastX: 0,
     lastY: 0,
     lastTime: performance.now(),
-    lastDraw: 0,
-    frameInterval: 1000 / 60,
+    buffers: [],
   };
 
-  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-  const smoothstep = (min, max, value) => {
-    const x = clamp((value - min) / (max - min), 0, 1);
-    return x * x * (3 - 2 * x);
-  };
+  let geometry;
 
-  function petalPosition(petal, u, v, openness = state.openness) {
-    const open = 0.18 + openness * 0.82;
-    const widthProfile =
-      0.055 +
-      Math.pow(Math.sin(Math.PI * Math.min(0.9, u * 0.9)), 0.52) *
-        (0.62 + u * 0.38);
-    const angularWidth = petal.width * widthProfile * (0.22 + openness * 0.78);
-    const theta =
-      petal.angle +
-      petal.twist * u * u +
-      v * angularWidth +
-      Math.sin(u * Math.PI) * petal.lean;
-
-    const pinchedSide = v * v * (2.2 + petal.layer * 0.36) * u;
-    const radius = petal.radius + petal.length * u * open - pinchedSide;
-    const x = radius * Math.cos(theta);
-    const z = radius * 0.78 * Math.sin(theta);
-
-    const arch = Math.sin(Math.PI * u) * (16 - petal.layer * 0.72);
-    const ridge =
-      (1 - v * v) *
-      Math.sin(Math.PI * u) *
-      (5.5 + petal.layer * 0.66);
-    const closingLift = (1 - openness) * petal.length * u * 0.82;
-    const tipCurl = petal.curl * Math.pow(smoothstep(0.66, 1, u), 1.7) * openness;
-    const edgeRuffle =
-      Math.sin(v * Math.PI * 3.4 + petal.phase) *
-      Math.pow(Math.abs(v), 2.4) *
-      u *
-      u *
-      (1.4 + petal.layer * 0.65);
-    const asymmetricFold =
-      Math.sin(theta * 2.3 + petal.phase) * u * (0.7 + petal.layer * 0.18);
-
-    const y =
-      petal.height -
-      petal.drop * u * openness +
-      arch * openness +
-      ridge +
-      closingLift +
-      tipCurl +
-      edgeRuffle +
-      asymmetricFold;
-
-    return { x, y, z };
+  function random() {
+    state.randomState += 0x6d2b79f5;
+    let value = state.randomState;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   }
 
-  function rotatePoint(point) {
-    const cosY = Math.cos(state.rotationY);
-    const sinY = Math.sin(state.rotationY);
-    const x1 = point.x * cosY - point.z * sinY;
-    const z1 = point.x * sinY + point.z * cosY;
+  function gaussian() {
+    const u = Math.max(random(), 1e-7);
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(Math.PI * 2 * random());
+  }
 
-    const cosX = Math.cos(state.rotationX);
-    const sinX = Math.sin(state.rotationX);
+  function resetGeometry() {
+    geometry = {
+      positions: [],
+      colors: [],
+      sizes: [],
+      seeds: [],
+      scatters: [],
+      delays: [],
+      kinds: [],
+    };
+    state.randomState = state.mobile ? 20260825 : 20260826;
+  }
+
+  function addPoint(x, y, z, color, size, alpha, scatterRadius = 320, delay = random(), kind = 0) {
+    geometry.positions.push(x, y, z);
+    geometry.colors.push(color[0], color[1], color[2], alpha);
+    geometry.sizes.push(size);
+    geometry.seeds.push(random());
+
+    let sx = gaussian();
+    let sy = gaussian();
+    let sz = gaussian();
+    const length = Math.hypot(sx, sy, sz) || 1;
+    const magnitude = scatterRadius * (0.36 + random() * 0.64);
+    sx = (sx / length) * magnitude;
+    sy = (sy / length) * magnitude;
+    sz = (sz / length) * magnitude;
+    geometry.scatters.push(sx, sy, sz);
+    geometry.delays.push(delay);
+    geometry.kinds.push(kind);
+  }
+
+  function rotateLocal(x, y, z, tiltX, tiltY, roll) {
+    const cr = Math.cos(roll);
+    const sr = Math.sin(roll);
+    const x1 = x * cr - y * sr;
+    const y1 = x * sr + y * cr;
+
+    const cx = Math.cos(tiltX);
+    const sx = Math.sin(tiltX);
+    const y2 = y1 * cx - z * sx;
+    const z2 = y1 * sx + z * cx;
+
+    const cy = Math.cos(tiltY);
+    const sy = Math.sin(tiltY);
     return {
-      x: x1,
-      y: point.y * cosX - z1 * sinX,
-      z: point.y * sinX + z1 * cosX,
+      x: x1 * cy - z2 * sy,
+      y: y2,
+      z: x1 * sy + z2 * cy,
     };
   }
 
-  function projectPoint(point, centerX, centerY) {
-    const rotated = rotatePoint(point);
-    const perspective = 620 / (620 + rotated.z * state.scale);
-    return {
-      x: centerX + rotated.x * state.scale * perspective,
-      y: centerY - rotated.y * state.scale * perspective,
-      z: rotated.z * state.scale,
-      perspective,
-      rx: rotated.x,
-      ry: rotated.y,
-      rz: rotated.z,
-    };
-  }
+  function generateRose(config) {
+    const layerCounts = [3, 4, 5, 7, 9, 12, 15];
+    const samplesPerPetal = state.mobile ? 34 : 48;
+    const scale = config.size / 50;
 
-  function buildGeometry() {
-    const uSteps = state.mobile ? 7 : 10;
-    const vSteps = state.mobile ? 4 : 6;
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    state.petals = [];
+    layerCounts.forEach((petalCount, layer) => {
+      const layerRatio = layer / (layerCounts.length - 1);
+      for (let petalIndex = 0; petalIndex < petalCount; petalIndex += 1) {
+        const centerAngle =
+          (petalIndex / petalCount) * Math.PI * 2 +
+          layer * 0.59 +
+          (random() - 0.5) * 0.14;
+        const twist = (random() - 0.5) * 0.18;
 
-    layerBlueprints.forEach((layer, layerIndex) => {
-      for (let index = 0; index < layer.count; index += 1) {
-        const variance = (Math.random() - 0.5) * 0.12;
-        const petal = {
-          ...layer,
-          layer: layerIndex,
-          angle: (index / layer.count) * TAU + layerIndex * goldenAngle + variance,
-          twist: (Math.random() - 0.5) * (0.17 + layerIndex * 0.012),
-          lean: (Math.random() - 0.5) * 0.045,
-          phase: Math.random() * TAU,
-          hue: 337 + layerIndex * 1.35 + (Math.random() - 0.5) * 5,
-          saturation: 78 + Math.random() * 14,
-          baseLight: 64 - layerIndex * 3.45 + Math.random() * 4,
-          uSteps,
-          vSteps,
-          uv: [],
-        };
+        for (let sample = 0; sample < samplesPerPetal; sample += 1) {
+          const u = Math.pow(random(), 0.72);
+          const v = random() * 2 - 1;
+          const widthProfile = 0.08 + Math.pow(Math.sin(Math.PI * Math.min(0.94, u)), 0.58) * 0.92;
+          const theta =
+            centerAngle +
+            v * (Math.PI / petalCount) * 1.26 * widthProfile +
+            twist * u * u;
+          const baseRadius = layer * 5.2;
+          const petalLength = 8.5 + layer * 1.52;
+          const radius = (baseRadius + petalLength * u) * (1 - v * v * 0.055);
+          const localX = Math.cos(theta) * radius * scale;
+          const localY = Math.sin(theta) * radius * scale;
+          const ridge = (1 - v * v) * Math.sin(Math.PI * u) * (2.2 + layer * 0.34);
+          const localZ =
+            (13 - layer * 1.72 + ridge - u * 1.8 + gaussian() * 0.42) * scale;
+          const rotated = rotateLocal(
+            localX,
+            localY,
+            localZ,
+            config.tiltX,
+            config.tiltY,
+            config.roll,
+          );
 
-        for (let ui = 0; ui <= uSteps; ui += 1) {
-          for (let vi = 0; vi <= vSteps; vi += 1) {
-            petal.uv.push({ u: ui / uSteps, v: (vi / vSteps) * 2 - 1 });
-          }
+          let lightness = 0.48 + layerRatio * 0.35 + (1 - Math.abs(v)) * 0.1;
+          lightness += (random() - 0.5) * 0.1;
+          const crimson = random() < 0.055 + (1 - layerRatio) * 0.025;
+          const color = crimson
+            ? [1, 0.16 + random() * 0.11, 0.31 + random() * 0.12]
+            : [
+                1,
+                0.22 + lightness * 0.62,
+                0.39 + lightness * 0.55,
+              ];
+          const edgeGlow = Math.pow(Math.abs(v), 2.8);
+          addPoint(
+            config.x + rotated.x + gaussian() * 0.42,
+            config.y + rotated.y + gaussian() * 0.42,
+            config.z + rotated.z + gaussian() * 0.3,
+            color,
+            1.55 + random() * 2.35 + edgeGlow * 0.95,
+            0.58 + random() * 0.32 + edgeGlow * 0.08,
+            310,
+            random(),
+            2,
+          );
         }
-        state.petals.push(petal);
       }
     });
 
-    const sparkleCount = state.mobile ? 2700 : 4700;
-    state.sparkles = Array.from({ length: sparkleCount }, (_, index) => {
-      const pick = Math.pow(Math.random(), 0.88);
-      const petalIndex = Math.min(state.petals.length - 1, Math.floor(pick * state.petals.length));
-      const petal = state.petals[petalIndex];
-      const layerRatio = petal.layer / (layerBlueprints.length - 1);
-      const bright = Math.random() < 0.055;
-      const mix = clamp(layerRatio * 0.88 + Math.random() * 0.22, 0, 1);
-      return {
-        petalIndex,
-        u: Math.pow(Math.random(), 0.76),
-        v: Math.random() * 2 - 1,
-        jitterX: (Math.random() - 0.5) * 2.4,
-        jitterY: (Math.random() - 0.5) * 2.4,
-        jitterZ: (Math.random() - 0.5) * 2.4,
-        scatterX: (Math.random() - 0.5) * (290 + layerRatio * 120),
-        scatterY: (Math.random() - 0.5) * 320,
-        scatterZ: (Math.random() - 0.5) * 300,
-        size: bright ? 1.45 + Math.random() * 1.2 : 0.32 + Math.random() * 0.92,
-        alpha: bright ? 0.8 : 0.22 + Math.random() * 0.58,
-        phase: Math.random() * TAU,
-        delay: index / sparkleCount,
-        r: Math.round(255 - mix * 21),
-        g: Math.round(229 - mix * 151),
-        b: Math.round(240 - mix * 92),
-      };
+    const coreCount = state.mobile ? 210 : 300;
+    for (let index = 0; index < coreCount; index += 1) {
+      const progress = index / coreCount;
+      const angle = progress * Math.PI * 10.5 + random() * 0.28;
+      const radius = (2.2 + progress * 21) * scale;
+      const local = rotateLocal(
+        Math.cos(angle) * radius,
+        Math.sin(angle) * radius,
+        (13.5 - progress * 6 + gaussian() * 0.7) * scale,
+        config.tiltX,
+        config.tiltY,
+        config.roll,
+      );
+      addPoint(
+        config.x + local.x,
+        config.y + local.y,
+        config.z + local.z,
+        [1, 0.19 + progress * 0.28, 0.32 + progress * 0.28],
+        1.85 + random() * 2.6,
+        0.66 + random() * 0.3,
+        330,
+        random(),
+        1,
+      );
+    }
+
+    const haloCount = state.mobile ? 390 : 560;
+    for (let index = 0; index < haloCount; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const radius = config.size * (0.58 + Math.pow(random(), 0.62) * 0.55);
+      const local = rotateLocal(
+        Math.cos(angle) * radius,
+        Math.sin(angle) * radius,
+        gaussian() * config.size * 0.2,
+        config.tiltX,
+        config.tiltY,
+        config.roll,
+      );
+      addPoint(
+        config.x + local.x + gaussian() * 3.2,
+        config.y + local.y + gaussian() * 3.2,
+        config.z + local.z + gaussian() * 2.3,
+        [1, 0.78 + random() * 0.18, 0.83 + random() * 0.14],
+        0.75 + random() * 1.75,
+        0.09 + random() * 0.25,
+        360,
+      );
+    }
+  }
+
+  function generateLeaf(config) {
+    const count = state.mobile ? 610 : 880;
+    const cos = Math.cos(config.angle);
+    const sin = Math.sin(config.angle);
+    for (let index = 0; index < count; index += 1) {
+      const along = random() * 2 - 1;
+      const across = random() * 2 - 1;
+      const widthProfile = Math.pow(Math.max(0, 1 - Math.pow(Math.abs(along), 1.6)), 0.62);
+      const localX = along * config.length * 0.5;
+      const localY = across * config.width * 0.5 * widthProfile;
+      const x = config.x + localX * cos - localY * sin;
+      const y = config.y + localX * sin + localY * cos;
+      const z = config.z + (1 - across * across) * 5 + gaussian() * 1.6;
+      const vein = 1 - Math.abs(across);
+      addPoint(
+        x,
+        y,
+        z,
+        [
+          0.54 + vein * 0.2 + random() * 0.08,
+          0.57 + vein * 0.2 + random() * 0.08,
+          0.5 + vein * 0.15 + random() * 0.07,
+        ],
+        1.05 + random() * 1.85,
+        0.42 + random() * 0.42,
+        350,
+        random(),
+        2,
+      );
+    }
+
+    for (let index = 0; index < 90; index += 1) {
+      const along = index / 89 * 2 - 1;
+      const localX = along * config.length * 0.5;
+      addPoint(
+        config.x + localX * cos + gaussian() * 0.55,
+        config.y + localX * sin + gaussian() * 0.55,
+        config.z + 5.5,
+        [0.83, 0.85, 0.76],
+        1.1 + random() * 1.15,
+        0.52 + random() * 0.28,
+        340,
+        random(),
+        2,
+      );
+    }
+  }
+
+  function generateStem(from, to, thickness = 3, count = 160) {
+    for (let index = 0; index < count; index += 1) {
+      const t = random();
+      const curve = Math.sin(t * Math.PI) * (random() - 0.5) * 7;
+      addPoint(
+        from.x + (to.x - from.x) * t + gaussian() * thickness + curve,
+        from.y + (to.y - from.y) * t + gaussian() * thickness * 0.42,
+        from.z + (to.z - from.z) * t + gaussian() * thickness,
+        random() < 0.55 ? [0.42, 0.18, 0.23] : [0.34, 0.35, 0.24],
+        0.65 + random() * 1.15,
+        0.16 + random() * 0.36,
+        330,
+      );
+    }
+  }
+
+  function generateWrapperPanel(apex, left, right, depth) {
+    const count = state.mobile ? 470 : 690;
+    for (let index = 0; index < count; index += 1) {
+      const root = Math.sqrt(random());
+      const split = random();
+      const a = 1 - root;
+      const b = root * (1 - split);
+      const c = root * split;
+      const edge = Math.min(a, b, c);
+      addPoint(
+        apex.x * a + left.x * b + right.x * c + gaussian() * 1.2,
+        apex.y * a + left.y * b + right.y * c + gaussian() * 1.2,
+        depth + gaussian() * 2.2,
+        edge < 0.035 ? [1, 0.96, 0.98] : [0.88, 0.86, 0.82],
+        0.8 + random() * 1.45,
+        edge < 0.035 ? 0.5 + random() * 0.3 : 0.08 + random() * 0.16,
+        360,
+        random(),
+        2,
+      );
+    }
+  }
+
+  function generateRibbon() {
+    const loopCount = state.mobile ? 780 : 1100;
+    [-1, 1].forEach((side) => {
+      for (let index = 0; index < loopCount; index += 1) {
+        const angle = random() * Math.PI * 2;
+        const centerX = side * 31;
+        const x = centerX + Math.cos(angle) * 31 + gaussian() * 2.2;
+        const y = -79 + Math.sin(angle) * 18 + gaussian() * 1.8;
+        const z = -8 + Math.sin(angle * 2) * 5 + gaussian() * 1.8;
+        addPoint(
+          x,
+          y,
+          z,
+          [1, 0.9 + random() * 0.08, 0.93 + random() * 0.06],
+          1.05 + random() * 1.85,
+          0.55 + random() * 0.32,
+          380,
+          random(),
+          2,
+        );
+      }
     });
 
-    const dustCount = state.mobile ? 125 : 220;
-    state.dust = Array.from({ length: dustCount }, () => ({
-      angle: Math.random() * TAU,
-      radius: 145 + Math.pow(Math.random(), 0.55) * 180,
-      height: (Math.random() - 0.5) * 300,
-      depth: (Math.random() - 0.5) * 190,
-      speed: (0.000035 + Math.random() * 0.0001) * (Math.random() < 0.5 ? -1 : 1),
-      size: 0.25 + Math.random() * 0.95,
-      alpha: 0.06 + Math.random() * 0.3,
-      phase: Math.random() * TAU,
-    }));
+    for (let index = 0; index < 620; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const radius = Math.pow(random(), 0.5) * 12;
+      addPoint(
+        Math.cos(angle) * radius,
+        -80 + Math.sin(angle) * radius * 0.68,
+        -16 + gaussian() * 4,
+        [1, 0.88 + random() * 0.11, 0.92 + random() * 0.07],
+        1.15 + random() * 1.9,
+        0.62 + random() * 0.32,
+        390,
+        random(),
+        2,
+      );
+    }
 
-    const starCount = state.mobile ? 70 : 135;
-    state.stars = Array.from({ length: starCount }, () => ({
-      x: Math.random() * state.width,
-      y: Math.random() * state.height,
-      size: 0.2 + Math.random() * 0.9,
-      alpha: 0.035 + Math.random() * 0.26,
-      phase: Math.random() * TAU,
-    }));
+    [-1, 1].forEach((side) => {
+      for (let index = 0; index < 460; index += 1) {
+        const t = random();
+        const x = side * (t * 42 - t * t * 18) + gaussian() * 2.3;
+        const y = -88 - t * 78 + Math.sin(t * Math.PI) * 9 + gaussian() * 1.5;
+        addPoint(
+          x,
+          y,
+          -1 + gaussian() * 2.5,
+          [0.95, 0.83 + random() * 0.12, 0.88 + random() * 0.1],
+          0.95 + random() * 1.65,
+          0.45 + random() * 0.35,
+          380,
+          random(),
+          2,
+        );
+      }
+    });
+  }
+
+  function generateCube() {
+    const x = 205;
+    const yBottom = -190;
+    const yTop = 225;
+    const z = 170;
+    const corners = [
+      [-x, yBottom, -z], [x, yBottom, -z], [x, yTop, -z], [-x, yTop, -z],
+      [-x, yBottom, z], [x, yBottom, z], [x, yTop, z], [-x, yTop, z],
+    ];
+    const edges = [
+      [0, 1], [1, 2], [2, 3], [3, 0],
+      [4, 5], [5, 6], [6, 7], [7, 4],
+      [0, 4], [1, 5], [2, 6], [3, 7],
+    ];
+    edges.forEach(([startIndex, endIndex]) => {
+      const start = corners[startIndex];
+      const end = corners[endIndex];
+      const distance = Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]);
+      const steps = Math.ceil(distance / 3.3);
+      for (let index = 0; index <= steps; index += 1) {
+        const t = index / steps;
+        addPoint(
+          start[0] + (end[0] - start[0]) * t,
+          start[1] + (end[1] - start[1]) * t,
+          start[2] + (end[2] - start[2]) * t,
+          [0.82, 0.86, 0.9],
+          1.35 + random() * 0.9,
+          0.49 + random() * 0.29,
+          440,
+          index / steps,
+        );
+      }
+    });
+  }
+
+  function generateAmbientDust() {
+    const count = state.mobile ? 1500 : 2400;
+    for (let index = 0; index < count; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const radius = 160 + Math.pow(random(), 0.55) * 185;
+      addPoint(
+        Math.cos(angle) * radius + gaussian() * 16,
+        (random() - 0.45) * 410,
+        Math.sin(angle) * radius * 0.55 + gaussian() * 30,
+        random() < 0.72 ? [1, 0.57, 0.68] : [0.75, 0.77, 0.69],
+        0.35 + random() * 1.1,
+        0.025 + random() * 0.11,
+        440,
+      );
+    }
+  }
+
+  function buildBouquet() {
+    resetGeometry();
+    generateCube();
+    generateAmbientDust();
+
+    const roses = [
+      { x: -108, y: 73, z: 30, size: 43, tiltX: 0.08, tiltY: -0.24, roll: -0.1 },
+      { x: -55, y: 69, z: -5, size: 53, tiltX: -0.06, tiltY: -0.1, roll: 0.18 },
+      { x: 2, y: 73, z: -25, size: 57, tiltX: 0.04, tiltY: 0.02, roll: -0.12 },
+      { x: 61, y: 72, z: -4, size: 52, tiltX: -0.04, tiltY: 0.12, roll: 0.1 },
+      { x: 112, y: 81, z: 30, size: 43, tiltX: 0.08, tiltY: 0.24, roll: -0.16 },
+      { x: -82, y: 126, z: 9, size: 49, tiltX: 0.04, tiltY: -0.15, roll: -0.08 },
+      { x: -28, y: 127, z: -27, size: 55, tiltX: -0.05, tiltY: -0.06, roll: 0.12 },
+      { x: 34, y: 129, z: -29, size: 55, tiltX: 0.02, tiltY: 0.06, roll: -0.16 },
+      { x: 89, y: 129, z: 8, size: 48, tiltX: 0.06, tiltY: 0.17, roll: 0.16 },
+      { x: -51, y: 178, z: 21, size: 45, tiltX: -0.07, tiltY: -0.1, roll: -0.05 },
+      { x: 4, y: 184, z: -3, size: 50, tiltX: 0.02, tiltY: 0, roll: 0.14 },
+      { x: 60, y: 177, z: 22, size: 44, tiltX: -0.05, tiltY: 0.13, roll: -0.12 },
+    ];
+
+    roses.forEach((rose) => generateStem(
+      { x: rose.x * 0.62, y: rose.y - rose.size * 0.35, z: rose.z + 16 },
+      { x: rose.x * 0.08, y: -175, z: 18 + rose.z * 0.12 },
+      2.4,
+      state.mobile ? 125 : 180,
+    ));
+
+    [
+      { x: -136, y: 72, z: 36, length: 105, width: 35, angle: 2.56 },
+      { x: 137, y: 75, z: 38, length: 102, width: 34, angle: 0.57 },
+      { x: -122, y: 119, z: 23, length: 89, width: 30, angle: 2.78 },
+      { x: 123, y: 122, z: 24, length: 91, width: 30, angle: 0.38 },
+      { x: -83, y: 34, z: 1, length: 82, width: 27, angle: 2.24 },
+      { x: 83, y: 34, z: 3, length: 82, width: 27, angle: 0.9 },
+      { x: -142, y: 158, z: 52, length: 72, width: 25, angle: 2.94 },
+      { x: 142, y: 159, z: 54, length: 72, width: 25, angle: 0.22 },
+      { x: -65, y: 8, z: 29, length: 74, width: 24, angle: 1.92 },
+      { x: 66, y: 8, z: 31, length: 74, width: 24, angle: 1.22 },
+    ].forEach(generateLeaf);
+
+    generateWrapperPanel({ x: 0, y: -119 }, { x: -139, y: 45 }, { x: -27, y: 38 }, 38);
+    generateWrapperPanel({ x: 0, y: -121 }, { x: 29, y: 41 }, { x: 139, y: 47 }, 41);
+    generateWrapperPanel({ x: -8, y: -125 }, { x: -100, y: 18 }, { x: 22, y: 42 }, -5);
+    generateWrapperPanel({ x: 8, y: -124 }, { x: -18, y: 43 }, { x: 101, y: 20 }, -8);
+    generateRibbon();
+
+    for (let index = 0; index < (state.mobile ? 1300 : 1900); index += 1) {
+      const t = random();
+      addPoint(
+        gaussian() * (8 + t * 4),
+        -82 - t * 108 + gaussian() * 2.1,
+        12 + gaussian() * 9,
+        random() < 0.58 ? [0.48, 0.16, 0.22] : [0.34, 0.29, 0.2],
+        0.65 + random() * 1.2,
+        0.13 + random() * 0.33,
+        350,
+      );
+    }
+
+    roses.forEach(generateRose);
+    uploadGeometry();
+  }
+
+  function bindAttribute(name, values, size) {
+    const buffer = gl.createBuffer();
+    state.buffers.push(buffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(attributes[name]);
+    gl.vertexAttribPointer(attributes[name], size, gl.FLOAT, false, 0, 0);
+  }
+
+  function uploadGeometry() {
+    state.buffers.forEach((buffer) => gl.deleteBuffer(buffer));
+    state.buffers = [];
+    gl.useProgram(program);
+    bindAttribute("position", geometry.positions, 3);
+    bindAttribute("color", geometry.colors, 4);
+    bindAttribute("size", geometry.sizes, 1);
+    bindAttribute("seed", geometry.seeds, 1);
+    bindAttribute("scatter", geometry.scatters, 3);
+    bindAttribute("delay", geometry.delays, 1);
+    bindAttribute("kind", geometry.kinds, 1);
+    state.pointCount = geometry.sizes.length;
   }
 
   function resize() {
@@ -217,233 +644,70 @@
     state.height = innerHeight;
     state.mobile = state.width < 700;
     state.dpr = Math.min(devicePixelRatio || 1, state.mobile ? 1.75 : 2);
-    state.frameInterval = state.mobile ? 1000 / 42 : 1000 / 60;
+    state.scale = Math.min(state.width / 450, state.height / 700, 1.82);
 
     canvas.width = Math.round(state.width * state.dpr);
     canvas.height = Math.round(state.height * state.dpr);
     canvas.style.width = `${state.width}px`;
     canvas.style.height = `${state.height}px`;
-    ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+    gl.viewport(0, 0, canvas.width, canvas.height);
 
-    state.scale = Math.min(state.width / 470, state.height / 660, 1.75);
-
-    if (!state.petals.length || wasMobile !== state.mobile) {
-      buildGeometry();
-    } else {
-      state.stars.forEach((star) => {
-        star.x = Math.random() * state.width;
-        star.y = Math.random() * state.height;
-      });
-    }
-  }
-
-  function drawStars(time) {
-    for (const star of state.stars) {
-      const pulse = reduceMotion ? 0.7 : 0.52 + Math.sin(time * 0.0012 + star.phase) * 0.48;
-      ctx.fillStyle = `rgba(255, 207, 226, ${star.alpha * pulse})`;
-      ctx.beginPath();
-      ctx.arc(star.x, star.y, star.size, 0, TAU);
-      ctx.fill();
-    }
-  }
-
-  function drawAura(centerX, centerY) {
-    const radius = Math.min(state.width * 0.48, 390) * state.scale;
-    const aura = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
-    aura.addColorStop(0, `rgba(255, 42, 116, ${0.11 + state.flash * 0.13})`);
-    aura.addColorStop(0.26, "rgba(173, 24, 79, 0.065)");
-    aura.addColorStop(0.64, "rgba(78, 8, 36, 0.028)");
-    aura.addColorStop(1, "rgba(20, 2, 10, 0)");
-    ctx.fillStyle = aura;
-    ctx.beginPath();
-    ctx.arc(centerX, centerY, radius, 0, TAU);
-    ctx.fill();
-  }
-
-  function smoothClosedPath(points) {
-    const last = points[points.length - 1];
-    const first = points[0];
-    ctx.beginPath();
-    ctx.moveTo((last.x + first.x) / 2, (last.y + first.y) / 2);
-    for (let index = 0; index < points.length; index += 1) {
-      const point = points[index];
-      const next = points[(index + 1) % points.length];
-      ctx.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
-    }
-    ctx.closePath();
-  }
-
-  function smoothOpenPath(points) {
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let index = 1; index < points.length - 1; index += 1) {
-      const point = points[index];
-      const next = points[index + 1];
-      ctx.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
-    }
-    const last = points[points.length - 1];
-    ctx.lineTo(last.x, last.y);
-  }
-
-  function petalTrace(petal, v, samples, centerX, centerY) {
-    const points = [];
-    const pulse = 1 + state.flash * 0.028;
-    for (let index = 0; index <= samples; index += 1) {
-      const point = petalPosition(petal, index / samples, v);
-      point.x *= pulse;
-      point.y *= pulse;
-      point.z *= pulse;
-      points.push(projectPoint(point, centerX, centerY));
-    }
-    return points;
-  }
-
-  function drawBloom(centerX, centerY) {
-    const samples = state.mobile ? 10 : 14;
-    const renderedPetals = state.petals.map((petal) => {
-      const left = petalTrace(petal, -1, samples, centerX, centerY);
-      const right = petalTrace(petal, 1, samples, centerX, centerY);
-      const center = petalTrace(petal, 0, samples, centerX, centerY);
-      const boundary = [...left, ...right.slice().reverse()];
-      const depth = center.reduce((sum, point) => sum + point.z, 0) / center.length;
-      return { petal, left, right, center, boundary, depth };
-    });
-
-    renderedPetals.sort((left, right) => right.depth - left.depth);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    for (const rendered of renderedPetals) {
-      const { petal, boundary, center } = rendered;
-      const base = center[0];
-      const tip = center[center.length - 1];
-      const facing = 0.5 + Math.cos(petal.angle - state.rotationY) * 0.5;
-      const depthLight = clamp(1 - rendered.depth / 360, 0.68, 1.22);
-      const baseLight = clamp(petal.baseLight * depthLight, 28, 72);
-      const highlight = clamp(baseLight + 14 + facing * 9, 44, 86);
-
-      const bodyGradient = ctx.createLinearGradient(base.x, base.y, tip.x, tip.y);
-      bodyGradient.addColorStop(0, `hsla(${petal.hue + 4}, ${petal.saturation}%, ${clamp(baseLight - 12, 22, 60)}%, 0.94)`);
-      bodyGradient.addColorStop(0.46, `hsla(${petal.hue - 3}, ${petal.saturation + 4}%, ${highlight}%, 0.96)`);
-      bodyGradient.addColorStop(0.78, `hsla(${petal.hue}, ${petal.saturation}%, ${clamp(baseLight + 9, 38, 77)}%, 0.94)`);
-      bodyGradient.addColorStop(1, `hsla(${petal.hue + 5}, ${petal.saturation}%, ${clamp(baseLight - 1, 30, 68)}%, 0.9)`);
-
-      smoothClosedPath(boundary);
-      ctx.fillStyle = bodyGradient;
-      ctx.fill();
-      ctx.strokeStyle = `hsla(${petal.hue - 5}, 100%, 86%, ${0.13 + facing * 0.08})`;
-      ctx.lineWidth = 0.55 + state.scale * 0.26;
-      ctx.stroke();
-
-      const innerLeft = petalTrace(petal, -0.25, samples, centerX, centerY).slice(1);
-      const innerRight = petalTrace(petal, 0.18, samples, centerX, centerY).slice(1).reverse();
-      const sheen = [...innerLeft, ...innerRight];
-      const sheenGradient = ctx.createLinearGradient(base.x, base.y, tip.x, tip.y);
-      sheenGradient.addColorStop(0, "rgba(255,255,255,0)");
-      sheenGradient.addColorStop(0.45, `rgba(255, 228, 239, ${0.04 + facing * 0.08})`);
-      sheenGradient.addColorStop(0.82, `rgba(255, 245, 249, ${0.1 + facing * 0.1})`);
-      sheenGradient.addColorStop(1, "rgba(255,255,255,0)");
-      smoothClosedPath(sheen);
-      ctx.fillStyle = sheenGradient;
-      ctx.fill();
-
-      smoothOpenPath(center.slice(1));
-      ctx.strokeStyle = `rgba(255, 235, 243, ${0.06 + facing * 0.07})`;
-      ctx.lineWidth = 0.45 + state.scale * 0.22;
-      ctx.stroke();
-    }
-  }
-
-  function drawSparkles(time, centerX, centerY) {
-    const burst = Math.max(0, state.sparkBurst);
-    const points = [];
-    for (const sparkle of state.sparkles) {
-      const petal = state.petals[sparkle.petalIndex];
-      const point = petalPosition(petal, sparkle.u, sparkle.v);
-      const localBurst = Math.max(0, burst - sparkle.delay * 0.32);
-      const scatter = smoothstep(0, 1, Math.min(1, localBurst));
-      point.x += sparkle.jitterX + sparkle.scatterX * scatter;
-      point.y += sparkle.jitterY + sparkle.scatterY * scatter;
-      point.z += sparkle.jitterZ + sparkle.scatterZ * scatter;
-
-      const projected = projectPoint(point, centerX, centerY);
-      points.push({ ...projected, sparkle });
-    }
-
-    points.sort((a, b) => b.z - a.z);
-    ctx.globalCompositeOperation = "lighter";
-    for (const point of points) {
-      const sparkle = point.sparkle;
-      const twinkle = reduceMotion ? 0.75 : 0.58 + Math.sin(time * 0.0022 + sparkle.phase) * 0.42;
-      const depth = clamp(0.92 - point.z / 520, 0.45, 1.2);
-      const alpha = sparkle.alpha * twinkle * depth;
-      const size = Math.max(0.25, sparkle.size * state.scale * point.perspective);
-      ctx.fillStyle = `rgba(${sparkle.r}, ${sparkle.g}, ${sparkle.b}, ${alpha})`;
-      ctx.beginPath();
-      ctx.arc(point.x, point.y, size, 0, TAU);
-      ctx.fill();
-    }
-    ctx.globalCompositeOperation = "source-over";
-  }
-
-  function drawDust(time, centerX, centerY) {
-    ctx.globalCompositeOperation = "lighter";
-    for (const dust of state.dust) {
-      const angle = dust.angle + (reduceMotion ? 0 : time * dust.speed);
-      const point = {
-        x: Math.cos(angle) * dust.radius,
-        y: dust.height + Math.sin(time * 0.00042 + dust.phase) * 16,
-        z: Math.sin(angle) * dust.radius * 0.38 + dust.depth,
-      };
-      const projected = projectPoint(point, centerX, centerY);
-      const pulse = reduceMotion ? 0.65 : 0.52 + Math.sin(time * 0.0016 + dust.phase) * 0.48;
-      ctx.fillStyle = `rgba(255, 121, 169, ${dust.alpha * pulse})`;
-      ctx.beginPath();
-      ctx.arc(projected.x, projected.y, dust.size * projected.perspective, 0, TAU);
-      ctx.fill();
-    }
-    ctx.globalCompositeOperation = "source-over";
+    if (!state.pointCount || wasMobile !== state.mobile) buildBouquet();
   }
 
   function render(time) {
-    requestAnimationFrame(render);
-    if (time - state.lastDraw < state.frameInterval) return;
-    state.lastDraw = time;
-
     const delta = Math.min(34, time - state.lastTime);
     state.lastTime = time;
     const ease = 1 - Math.pow(0.001, delta / 1000);
 
     if (!state.pointerDown) state.targetRotationY += state.autoRotation * delta;
-    state.rotationX += (state.targetRotationX - state.rotationX) * ease * 2.45;
-    state.rotationY += (state.targetRotationY - state.rotationY) * ease * 2.45;
-    state.openness += (state.targetOpenness - state.openness) * ease * 0.7;
-    state.sparkBurst += (0 - state.sparkBurst) * ease * 0.82;
+    state.rotationX += (state.targetRotationX - state.rotationX) * ease * 2.2;
+    state.rotationY += (state.targetRotationY - state.rotationY) * ease * 2.2;
+    state.burst += (0 - state.burst) * ease * 0.72;
     state.flash *= Math.pow(0.982, delta);
 
-    ctx.clearRect(0, 0, state.width, state.height);
-    drawStars(time);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(program);
 
-    const centerX = state.width / 2;
-    const centerY = state.height * (state.mobile ? 0.505 : 0.53);
-    drawAura(centerX, centerY);
-    drawDust(time, centerX, centerY);
-    drawBloom(centerX, centerY);
-    drawSparkles(time, centerX, centerY);
+    gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+    gl.uniform2f(
+      uniforms.center,
+      canvas.width * 0.5,
+      canvas.height * (state.mobile ? 0.525 : 0.55),
+    );
+    gl.uniform1f(uniforms.scale, state.scale * state.dpr);
+    gl.uniform1f(uniforms.dpr, state.dpr);
+    gl.uniform1f(uniforms.time, reduceMotion ? 0 : time * 0.001);
+    gl.uniform1f(uniforms.rotationX, state.rotationX);
+    gl.uniform1f(uniforms.rotationY, state.rotationY);
+    gl.uniform1f(uniforms.burst, state.burst);
+    gl.uniform1f(uniforms.flash, state.flash);
+    gl.uniform1f(uniforms.pass, 0);
+    gl.drawArrays(gl.POINTS, 0, state.pointCount);
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.uniform1f(uniforms.pass, 1);
+    gl.drawArrays(gl.POINTS, 0, state.pointCount);
+
+    gl.uniform1f(uniforms.pass, 2);
+    gl.drawArrays(gl.POINTS, 0, state.pointCount);
+
+    requestAnimationFrame(render);
   }
 
   function triggerBloom() {
-    if (!reduceMotion) {
-      state.openness = 0.16;
-      state.targetOpenness = 1;
-      state.sparkBurst = 1.08;
-      state.flash = 1;
-      state.autoRotation = 0.0017;
-      clearTimeout(triggerBloom.timer);
-      triggerBloom.timer = setTimeout(() => {
-        state.autoRotation = 0.0007;
-      }, 2100);
-    }
+    if (reduceMotion) return;
+    state.burst = 1.08;
+    state.flash = 1;
+    state.autoRotation = 0.00022;
+    clearTimeout(triggerBloom.timer);
+    triggerBloom.timer = setTimeout(() => {
+      state.autoRotation = 0.000045;
+    }, 2300);
   }
 
   function pointerStart(event) {
@@ -460,7 +724,7 @@
     const dy = event.clientY - state.lastY;
     if (Math.abs(dx) + Math.abs(dy) > 2) state.dragged = true;
     state.targetRotationY += dx * 0.007;
-    state.targetRotationX = clamp(state.targetRotationX + dy * 0.005, -1.05, -0.15);
+    state.targetRotationX = Math.max(-0.58, Math.min(0.48, state.targetRotationX + dy * 0.005));
     state.lastX = event.clientX;
     state.lastY = event.clientY;
   }
